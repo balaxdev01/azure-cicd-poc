@@ -1,0 +1,19 @@
+[project]
+name = "svc-a-backend"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "pkg-db",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/svc_a"]
+
+[tool.uv.sources]
+pkg-db = { workspace = true }
