@@ -1,0 +1,134 @@
+name: Deploy
+
+# 検証項目5: タグからシステム名をパースし、該当アプリだけを対象にする
+# 検証項目6: 再ビルドせず、既存イメージにタグを付け替えてプロモートする
+#
+# タグ命名規則:
+#   <システム名>-rc-v<バージョン>-<連番>   例: svc-a-rc-v0.1.0-1   → 検証環境
+#   <システム名>-release-v<バージョン>     例: svc-a-release-v0.1.0 → 本番相当（承認ゲートあり）
+
+on:
+  push:
+    tags:
+      - '*-rc-v*'
+      - '*-release-v*'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ACR_NAME: acrbatchpoc21482
+
+jobs:
+  # タグを解析して、後続ジョブに「システム名」「チャネル」を渡す
+  parse:
+    runs-on: ubuntu-latest
+    outputs:
+      system: ${{ steps.parse.outputs.system }}
+      channel: ${{ steps.parse.outputs.channel }}
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - name: Parse tag
+        id: parse
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag: $TAG"
+
+          # svc-a-rc-v0.1.0-1        → system=svc-a, channel=rc,      version=0.1.0-1
+          # svc-a-release-v0.1.0     → system=svc-a, channel=release, version=0.1.0
+          if [[ "$TAG" =~ ^(.+)-(rc|release)-v(.+)$ ]]; then
+            SYSTEM="${BASH_REMATCH[1]}"
+            CHANNEL="${BASH_REMATCH[2]}"
+            VERSION="${BASH_REMATCH[3]}"
+          else
+            echo "::error::タグの形式が不正です: $TAG"
+            exit 1
+          fi
+
+          echo "system=$SYSTEM"   >> $GITHUB_OUTPUT
+          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          {
+            echo "### タグ解析結果"
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| タグ | \`$TAG\` |"
+            echo "| システム | \`$SYSTEM\` |"
+            echo "| チャネル | \`$CHANNEL\` |"
+            echo "| バージョン | \`$VERSION\` |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # rc: 検証環境向け。承認なしで流す
+  promote-rc:
+    needs: parse
+    if: needs.parse.outputs.channel == 'rc'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # 再ビルドしない。main で作られた commit hash タグのイメージに別名を付けるだけ。
+      # az acr import はレジストリ内のサーバサイドコピーなので pull/push が発生しない。
+      - name: Promote image (retag, no rebuild)
+        run: |
+          SYSTEM="${{ needs.parse.outputs.system }}"
+          SRC="${SYSTEM}-backend:${GITHUB_SHA}"
+          DST="${SYSTEM}-backend:${GITHUB_REF_NAME}"
+
+          echo "source: $SRC"
+          echo "target: $DST"
+
+          az acr import \
+            --name ${{ env.ACR_NAME }} \
+            --source "${{ env.ACR_NAME }}.azurecr.io/${SRC}" \
+            --image "${DST}"
+
+          echo "### プロモート完了（rc）" >> $GITHUB_STEP_SUMMARY
+          echo "\`${SRC}\` → \`${DST}\`" >> $GITHUB_STEP_SUMMARY
+
+  # release: 本番相当。GitHub Environments の承認ゲートで止まる
+  promote-release:
+    needs: parse
+    if: needs.parse.outputs.channel == 'release'
+    runs-on: ubuntu-latest
+    environment: production   # ← リポジトリ側で Required reviewers を設定しておく
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Promote image (retag, no rebuild)
+        run: |
+          SYSTEM="${{ needs.parse.outputs.system }}"
+          SRC="${SYSTEM}-backend:${GITHUB_SHA}"
+          DST="${SYSTEM}-backend:${GITHUB_REF_NAME}"
+
+          echo "source: $SRC"
+          echo "target: $DST"
+
+          az acr import \
+            --name ${{ env.ACR_NAME }} \
+            --source "${{ env.ACR_NAME }}.azurecr.io/${SRC}" \
+            --image "${DST}"
+
+          echo "### プロモート完了（release）" >> $GITHUB_STEP_SUMMARY
+          echo "\`${SRC}\` → \`${DST}\`" >> $GITHUB_STEP_SUMMARY
+
+      # 検証項目6の肝: 検証環境で確認したものと同一のイメージであることを digest で示す
+      - name: Verify same digest
+        run: |
+          SYSTEM="${{ needs.parse.outputs.system }}"
+          az acr repository show-manifests \
+            --name ${{ env.ACR_NAME }} \
+            --repository "${SYSTEM}-backend" \
+            --query "[?contains(tags, '${GITHUB_SHA}')].{digest:digest, tags:tags}" \
+            -o table
