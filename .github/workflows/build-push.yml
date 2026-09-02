@@ -1,0 +1,66 @@
+name: Build and Push
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - '.github/workflows/build-push.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ACR_NAME: acrbatchpoc21482
+  IMAGE_NAME: svc-a-backend
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR Login
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      # ビルドコンテキストはリポジトリルート（末尾の "."）
+      # これにより Dockerfile 内で packages/ を COPY できる
+      - name: Build image
+        run: |
+          docker build \
+            -f apps/svc-a/backend/Dockerfile \
+            -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            .
+
+      # 共有コードがイメージに入り、import が通るかをここで確認する
+      - name: Verify shared package import
+        run: |
+          docker run --rm \
+            ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            python -c "from pkg_db import ping; print(ping())"
+
+      # ジョブ用エントリポイントが同一イメージで動くかも確認
+      - name: Verify job entrypoint
+        run: |
+          docker run --rm \
+            ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            python -m svc_a.entrypoints.jobs
+
+      - name: Push image
+        run: docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Summary
+        run: |
+          echo "### Pushed" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
