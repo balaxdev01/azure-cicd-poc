@@ -65,6 +65,7 @@ jobs:
     needs: parse
     if: needs.parse.outputs.channel == 'rc'
     runs-on: ubuntu-latest
+    environment: staging
     steps:
       - name: Azure Login (OIDC)
         uses: azure/login@v2
